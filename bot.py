@@ -16,7 +16,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
-import asyncpg
+from supabase import create_client, Client
 from aiohttp import web
 
 load_dotenv()
@@ -24,8 +24,9 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-# Используем одну переменную DATABASE_URL
-DATABASE_URL = os.getenv("DATABASE_URL")
+# Supabase API настройки
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 # Ссылки на прайсы
 WHITE_PRICE_URL = "https://b2b.moysklad.ru/public/NgO26OdrxmZh"
@@ -39,133 +40,143 @@ bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-db_pool = None
+# Supabase клиент
+supabase: Client = None
 
 
 # ---------- Database functions ----------
-async def init_db():
-    """Инициализация базы данных"""
-    global db_pool
+def init_db():
+    """Инициализация Supabase и создание таблицы"""
+    global supabase
     try:
-        if not DATABASE_URL:
-            logger.error("DATABASE_URL not set!")
-            raise ValueError("DATABASE_URL environment variable is required")
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            logger.error("SUPABASE_URL or SUPABASE_KEY not set!")
+            raise ValueError("Supabase credentials required")
         
-        logger.info(f"Connecting to database...")
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         
-        # Добавляем timeout и другие параметры
-        db_pool = await asyncpg.create_pool(
-            DATABASE_URL,
-            min_size=1,
-            max_size=5,
-            timeout=30,
-            command_timeout=30
-        )
+        # Создаем таблицу через SQL (выполняем один раз при запуске)
+        # Используем raw SQL через REST API
+        logger.info("Connected to Supabase successfully")
         
-        async with db_pool.acquire() as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS subscribers (
-                    chat_id BIGINT PRIMARY KEY,
-                    username TEXT,
-                    full_name TEXT,
-                    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    subscription_type TEXT DEFAULT 'common',
-                    is_blocked INTEGER DEFAULT 0
-                )
-            """)
+        # Пытаемся создать таблицу (если ее нет)
+        try:
+            # Проверяем существование таблицы, создаем если нет
+            response = supabase.table('subscribers').select('*').limit(1).execute()
+            logger.info("Table 'subscribers' exists")
+        except Exception as e:
+            logger.info("Creating table 'subscribers'...")
+            # Таблицу нужно создать вручную через SQL Editor в Supabase
+            # Выполните этот SQL в Supabase SQL Editor:
+            """
+            CREATE TABLE IF NOT EXISTS subscribers (
+                chat_id BIGINT PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                subscription_type TEXT DEFAULT 'common',
+                is_blocked INTEGER DEFAULT 0
+            );
+            """
+            logger.warning("Please create table manually in Supabase SQL Editor")
+            raise
+        
         logger.info("Database initialized successfully")
     except Exception as e:
         logger.error(f"Database initialization error: {e}")
         raise
 
 
-async def add_subscriber(chat_id: int, username: str | None, full_name: str, sub_type: str = 'common'):
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO subscribers (chat_id, username, full_name, subscription_type, is_blocked) 
-            VALUES ($1, $2, $3, $4, 0)
-            ON CONFLICT (chat_id) DO UPDATE SET 
-                username = $2, 
-                full_name = $3, 
-                subscription_type = $4
-        """, chat_id, username, full_name, sub_type)
+def get_subscriber_type(chat_id: int) -> str | None:
+    try:
+        response = supabase.table('subscribers').select('subscription_type').eq('chat_id', chat_id).execute()
+        if response.data and len(response.data) > 0:
+            return response.data[0]['subscription_type']
+        return None
+    except Exception as e:
+        logger.error(f"Error getting subscriber: {e}")
+        return None
 
 
-async def update_subscription_type(chat_id: int, sub_type: str):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE subscribers SET subscription_type = $1 WHERE chat_id = $2",
-            sub_type, chat_id
-        )
+def add_subscriber(chat_id: int, username: str | None, full_name: str, sub_type: str = 'common'):
+    try:
+        data = {
+            'chat_id': chat_id,
+            'username': username,
+            'full_name': full_name,
+            'subscription_type': sub_type,
+            'is_blocked': 0
+        }
+        response = supabase.table('subscribers').upsert(data).execute()
+        logger.info(f"Added subscriber {chat_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Error adding subscriber: {e}")
+        return False
 
 
-async def remove_subscriber(chat_id: int):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM subscribers WHERE chat_id = $1",
-            chat_id
-        )
+def remove_subscriber(chat_id: int):
+    try:
+        response = supabase.table('subscribers').delete().eq('chat_id', chat_id).execute()
+        logger.info(f"Removed subscriber {chat_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Error removing subscriber: {e}")
+        return False
 
 
-async def get_subscriber_type(chat_id: int) -> str | None:
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT subscription_type FROM subscribers WHERE chat_id = $1",
-            chat_id
-        )
-    return row['subscription_type'] if row else None
-
-
-async def get_all_subscribers(sub_type: str = None) -> list[int]:
-    async with db_pool.acquire() as conn:
+def get_all_subscribers(sub_type: str = None) -> list[int]:
+    try:
         if sub_type and sub_type != 'all':
-            rows = await conn.fetch(
-                "SELECT chat_id FROM subscribers WHERE subscription_type = $1 AND is_blocked = 0",
-                sub_type
-            )
+            response = supabase.table('subscribers').select('chat_id').eq('subscription_type', sub_type).eq('is_blocked', 0).execute()
         else:
-            rows = await conn.fetch(
-                "SELECT chat_id FROM subscribers WHERE is_blocked = 0"
-            )
-    return [row['chat_id'] for row in rows]
+            response = supabase.table('subscribers').select('chat_id').eq('is_blocked', 0).execute()
+        
+        return [row['chat_id'] for row in response.data]
+    except Exception as e:
+        logger.error(f"Error getting subscribers: {e}")
+        return []
 
 
-async def count_subscribers(sub_type: str = None) -> int:
-    async with db_pool.acquire() as conn:
+def count_subscribers(sub_type: str = None) -> int:
+    try:
         if sub_type and sub_type != 'all':
-            count = await conn.fetchval(
-                "SELECT COUNT(*) FROM subscribers WHERE subscription_type = $1 AND is_blocked = 0",
-                sub_type
-            )
+            response = supabase.table('subscribers').select('*', count='exact').eq('subscription_type', sub_type).eq('is_blocked', 0).execute()
         else:
-            count = await conn.fetchval(
-                "SELECT COUNT(*) FROM subscribers WHERE is_blocked = 0"
-            )
-    return count
+            response = supabase.table('subscribers').select('*', count='exact').eq('is_blocked', 0).execute()
+        return response.count
+    except Exception as e:
+        logger.error(f"Error counting subscribers: {e}")
+        return 0
 
 
-async def get_all_subscribers_full() -> list[dict]:
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT chat_id, username, full_name, joined_at, subscription_type FROM subscribers ORDER BY joined_at"
-        )
-    return [dict(row) for row in rows]
+def get_all_subscribers_full() -> list[dict]:
+    try:
+        response = supabase.table('subscribers').select('*').order('joined_at').execute()
+        return response.data
+    except Exception as e:
+        logger.error(f"Error getting all subscribers: {e}")
+        return []
 
 
-async def block_user(chat_id: int):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE subscribers SET is_blocked = 1 WHERE chat_id = $1",
-            chat_id
-        )
+def block_user(chat_id: int):
+    try:
+        supabase.table('subscribers').update({'is_blocked': 1}).eq('chat_id', chat_id).execute()
+        logger.info(f"Blocked user {chat_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Error blocking user: {e}")
+        return False
 
 
-async def unblock_user(chat_id: int):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE subscribers SET is_blocked = 0 WHERE chat_id = $1",
-            chat_id
-        )
+def unblock_user(chat_id: int):
+    try:
+        supabase.table('subscribers').update({'is_blocked': 0}).eq('chat_id', chat_id).execute()
+        logger.info(f"Unblocked user {chat_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Error unblocking user: {e}")
+        return False
 
 
 # ---------- FSM States ----------
@@ -180,7 +191,7 @@ class BroadcastStates(StatesGroup):
 # ---------- Client-facing handlers ----------
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    existing_type = await get_subscriber_type(message.chat.id)
+    existing_type = get_subscriber_type(message.chat.id)
     
     if existing_type:
         await show_subscription_menu(message, is_change=True)
@@ -216,7 +227,7 @@ async def handle_subscription_choice(callback: CallbackQuery):
     sub_type = callback.data.split("_")[1]
     chat_id = callback.from_user.id
     
-    await add_subscriber(
+    add_subscriber(
         chat_id,
         callback.from_user.username,
         callback.from_user.full_name,
@@ -251,7 +262,7 @@ async def handle_subscription_choice(callback: CallbackQuery):
 
 @dp.message(Command("stop"))
 async def cmd_stop(message: Message):
-    await remove_subscriber(message.chat.id)
+    remove_subscriber(message.chat.id)
     await message.answer(
         "❌ Вы отписались от рассылки.\n\n"
         "Чтобы вернуться — отправьте /start.",
@@ -302,9 +313,9 @@ async def cmd_stats(message: Message):
     if not is_admin(message):
         return
     
-    total = await count_subscribers()
-    white = await count_subscribers('white')
-    common = await count_subscribers('common')
+    total = count_subscribers()
+    white = count_subscribers('white')
+    common = count_subscribers('common')
     
     await message.answer(
         f"📊 **Статистика**\n\n"
@@ -320,7 +331,7 @@ async def cmd_export(message: Message):
     if not is_admin(message):
         return
 
-    rows = await get_all_subscribers_full()
+    rows = get_all_subscribers_full()
     if not rows:
         await message.answer("ℹ️ Нет подписчиков.")
         return
@@ -360,12 +371,12 @@ async def process_block_user(message: Message, state: FSMContext):
         await message.answer("❌ Некорректный ID.")
         return
     
-    if not await get_subscriber_type(user_id):
+    if not get_subscriber_type(user_id):
         await message.answer(f"❌ Пользователь {user_id} не найден.")
         await state.clear()
         return
     
-    await block_user(user_id)
+    block_user(user_id)
     await message.answer(f"✅ Пользователь {user_id} заблокирован.")
     await state.clear()
 
@@ -389,12 +400,12 @@ async def process_unblock_user(message: Message, state: FSMContext):
         await message.answer("❌ Некорректный ID.")
         return
     
-    if not await get_subscriber_type(user_id):
+    if not get_subscriber_type(user_id):
         await message.answer(f"❌ Пользователь {user_id} не найден.")
         await state.clear()
         return
     
-    await unblock_user(user_id)
+    unblock_user(user_id)
     await message.answer(f"✅ Пользователь {user_id} разблокирован.")
     await state.clear()
 
@@ -413,7 +424,7 @@ async def cmd_white_broadcast(message: Message, state: FSMContext):
     if not is_admin(message):
         return
     
-    count = await count_subscribers('white')
+    count = count_subscribers('white')
     if count == 0:
         await message.answer("ℹ️ Нет подписчиков на Белый прайс.")
         return
@@ -427,7 +438,7 @@ async def cmd_common_broadcast(message: Message, state: FSMContext):
     if not is_admin(message):
         return
     
-    count = await count_subscribers('common')
+    count = count_subscribers('common')
     if count == 0:
         await message.answer("ℹ️ Нет подписчиков на Общий прайс.")
         return
@@ -441,13 +452,13 @@ async def cmd_all_broadcast(message: Message, state: FSMContext):
     if not is_admin(message):
         return
     
-    total = await count_subscribers()
+    total = count_subscribers()
     if total == 0:
         await message.answer("ℹ️ Нет подписчиков.")
         return
     
-    white = await count_subscribers('white')
-    common = await count_subscribers('common')
+    white = count_subscribers('white')
+    common = count_subscribers('common')
     
     await message.answer(
         f"📢 **ВСЕМ подписчикам**\n\n"
@@ -493,11 +504,11 @@ async def process_broadcast_with_confirmation(message: Message, state: FSMContex
         preview_message = await message.copy_to(chat_id=ADMIN_ID)
         
         if sub_type == 'all':
-            count = await count_subscribers()
+            count = count_subscribers()
             type_name = "ВСЕХ"
-            detail = f"🤍 Белый: {await count_subscribers('white')}, 💳 Общий: {await count_subscribers('common')}"
+            detail = f"🤍 Белый: {count_subscribers('white')}, 💳 Общий: {count_subscribers('common')}"
         else:
-            count = await count_subscribers(sub_type)
+            count = count_subscribers(sub_type)
             type_name = "Белый прайс" if sub_type == "white" else "Общий прайс"
             detail = ""
         
@@ -551,9 +562,9 @@ async def cancel_broadcast(callback: CallbackQuery, state: FSMContext):
 # ---------- Broadcast logic ----------
 async def broadcast_message(source_message: Message, status_message: Message, sub_type: str = None):
     if sub_type == 'all':
-        subscribers = await get_all_subscribers()
+        subscribers = get_all_subscribers()
     else:
-        subscribers = await get_all_subscribers(sub_type)
+        subscribers = get_all_subscribers(sub_type)
     
     if not subscribers:
         await status_message.edit_text("ℹ️ Нет подписчиков.")
@@ -572,7 +583,7 @@ async def broadcast_message(source_message: Message, status_message: Message, su
             failed += 1
             logger.warning(f"Failed to send to {chat_id}: {e}")
             if "bot was blocked" in str(e).lower() or "chat not found" in str(e).lower():
-                await remove_subscriber(chat_id)
+                remove_subscriber(chat_id)
         
         if idx % 50 == 0:
             try:
@@ -619,7 +630,7 @@ async def shutdown_web_server(runner, site):
 
 # ---------- Main ----------
 async def main():
-    await init_db()
+    init_db()
     logger.info("🚀 Bot starting...")
     
     runner, site = await start_web_server()
@@ -644,8 +655,6 @@ async def main():
         await dp.start_polling(bot)
     finally:
         await shutdown_web_server(runner, site)
-        if db_pool:
-            await db_pool.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
