@@ -5,6 +5,7 @@ import logging
 import os
 import signal
 from datetime import datetime
+from urllib.parse import quote_plus
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -24,8 +25,15 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-# База данных PostgreSQL (Supabase)
-DATABASE_URL = os.getenv("DATABASE_URL")  # Добавьте эту переменную на Render
+# Параметры базы данных PostgreSQL (Supabase)
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "postgres")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+
+# Собираем URL с экранированием специальных символов
+DATABASE_URL = f"postgresql://{DB_USER}:{quote_plus(DB_PASSWORD)}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 # Ссылки на прайсы
 WHITE_PRICE_URL = "https://b2b.moysklad.ru/public/NgO26OdrxmZh"
@@ -39,7 +47,6 @@ bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# Глобальная переменная для пула соединений с БД
 db_pool = None
 
 
@@ -48,6 +55,7 @@ async def init_db():
     """Инициализация базы данных"""
     global db_pool
     try:
+        logger.info(f"Connecting to database at {DB_HOST}:{DB_PORT}/{DB_NAME}")
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
         
         async with db_pool.acquire() as conn:
@@ -105,7 +113,6 @@ async def get_subscriber_type(chat_id: int) -> str | None:
 
 
 async def get_all_subscribers(sub_type: str = None) -> list[int]:
-    """Получить подписчиков определенного типа или всех"""
     async with db_pool.acquire() as conn:
         if sub_type and sub_type != 'all':
             rows = await conn.fetch(
@@ -617,7 +624,6 @@ async def shutdown_web_server(runner, site):
 
 # ---------- Main ----------
 async def main():
-    # Инициализируем базу данных
     await init_db()
     logger.info("🚀 Bot starting...")
     
