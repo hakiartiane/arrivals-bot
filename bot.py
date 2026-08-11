@@ -42,6 +42,7 @@ dp = Dispatcher(storage=storage)
 class BroadcastStates(StatesGroup):
     waiting_white_price = State()      # Ожидание контента для белого прайса
     waiting_common_price = State()     # Ожидание контента для общего прайса
+    waiting_all_price = State()        # Ожидание контента для всех подписчиков
     waiting_block_user = State()       # Ожидание ID пользователя для блокировки
     waiting_unblock_user = State()     # Ожидание ID пользователя для разблокировки
 
@@ -281,6 +282,36 @@ def is_admin(message: Message) -> bool:
     return message.from_user.id == ADMIN_ID
 
 
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    """Список всех команд"""
+    if not is_admin(message):
+        await message.answer(
+            "📋 **Доступные команды:**\n\n"
+            "/start — Выбрать тип подписки\n"
+            "/stop — Отписаться от рассылки"
+        )
+        return
+    
+    await message.answer(
+        "📋 **Список всех команд:**\n\n"
+        "**Для клиентов:**\n"
+        "/start — Выбрать тип подписки\n"
+        "/stop — Отписаться от рассылки\n\n"
+        "**Для админа:**\n"
+        "/help — Показать это сообщение\n"
+        "/stats — Статистика подписчиков\n"
+        "/white — Рассылка для Белого прайса\n"
+        "/common — Рассылка для Общего прайса\n"
+        "/all — Рассылка для ВСЕХ подписчиков\n"
+        "/block — Заблокировать пользователя\n"
+        "/unblock — Разблокировать пользователя\n"
+        "/export — Экспорт базы в CSV\n"
+        "/cancel — Отменить текущее действие",
+        parse_mode="Markdown"
+    )
+
+
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
     if not is_admin(message):
@@ -447,6 +478,32 @@ async def cmd_common_broadcast(message: Message, state: FSMContext):
     await state.set_state(BroadcastStates.waiting_common_price)
 
 
+@dp.message(Command("all"))
+async def cmd_all_broadcast(message: Message, state: FSMContext):
+    if not is_admin(message):
+        return
+    
+    total = count_subscribers()
+    if total == 0:
+        await message.answer("ℹ️ Нет подписчиков для рассылки.")
+        return
+    
+    white_count = count_subscribers('white')
+    common_count = count_subscribers('common')
+    
+    await message.answer(
+        f"📢 **Рассылка для ВСЕХ подписчиков**\n\n"
+        f"👥 Всего получателей: {total}\n"
+        f"🤍 Белый прайс: {white_count}\n"
+        f"💳 Общий прайс: {common_count}\n\n"
+        f"Отправьте сообщение (текст, фото, видео или файл), "
+        f"которое получат ВСЕ подписчики.\n"
+        f"Для отмены отправьте /cancel",
+        parse_mode="Markdown"
+    )
+    await state.set_state(BroadcastStates.waiting_all_price)
+
+
 # ---------- Broadcast with confirmation ----------
 @dp.message(BroadcastStates.waiting_white_price)
 async def process_white_broadcast(message: Message, state: FSMContext):
@@ -460,6 +517,13 @@ async def process_common_broadcast(message: Message, state: FSMContext):
     if not is_admin(message):
         return
     await process_broadcast_with_confirmation(message, state, 'common')
+
+
+@dp.message(BroadcastStates.waiting_all_price)
+async def process_all_broadcast(message: Message, state: FSMContext):
+    if not is_admin(message):
+        return
+    await process_broadcast_with_confirmation(message, state, 'all')
 
 
 async def process_broadcast_with_confirmation(message: Message, state: FSMContext, sub_type: str):
@@ -478,8 +542,14 @@ async def process_broadcast_with_confirmation(message: Message, state: FSMContex
         preview_message = await message.copy_to(chat_id=ADMIN_ID)
         
         # Теперь отправляем ответ на это превью с кнопками
-        count = count_subscribers(sub_type)
-        type_name = "Белый прайс" if sub_type == "white" else "Общий прайс"
+        if sub_type == 'all':
+            count = count_subscribers()
+            type_name = "ВСЕХ подписчиков"
+            detail = f"🤍 Белый: {count_subscribers('white')}, 💳 Общий: {count_subscribers('common')}"
+        else:
+            count = count_subscribers(sub_type)
+            type_name = "Белый прайс" if sub_type == "white" else "Общий прайс"
+            detail = ""
         
         await bot.send_message(
             chat_id=ADMIN_ID,
@@ -487,6 +557,7 @@ async def process_broadcast_with_confirmation(message: Message, state: FSMContex
                 f"✉️ **Превью рассылки**\n\n"
                 f"📋 Тип: {type_name}\n"
                 f"👥 Получателей: {count}\n"
+                f"{detail}\n\n"
                 f"⚠️ Отправить это сообщение ВСЕМ подписчикам?"
             ),
             reply_markup=InlineKeyboardMarkup(
@@ -496,7 +567,7 @@ async def process_broadcast_with_confirmation(message: Message, state: FSMContex
                 ]
             ),
             parse_mode="Markdown",
-            reply_to_message_id=preview_message.message_id  # Привязываем кнопки к превью
+            reply_to_message_id=preview_message.message_id
         )
     except Exception as e:
         await message.answer(f"❌ Ошибка при создании превью: {e}")
@@ -537,7 +608,13 @@ async def broadcast_message(source_message: Message, status_message: Message, su
     
     sent, failed = 0, 0
     total = len(subscribers)
-    type_name = "Белый прайс" if sub_type == "white" else "Общий прайс"
+    
+    if sub_type == 'all':
+        type_name = "ВСЕХ подписчиков"
+    elif sub_type == 'white':
+        type_name = "Белый прайс"
+    else:
+        type_name = "Общий прайс"
     
     # Обновляем статус каждые 50 отправок
     for idx, chat_id in enumerate(subscribers):
@@ -598,6 +675,7 @@ async def shutdown_web_server(runner, site):
         logger.info("Health-check server stopped")
     except Exception as e:
         logger.warning(f"Error stopping web server: {e}")
+
 
 # ---------- Main ----------
 async def main():
