@@ -182,13 +182,13 @@ async def show_subscription_menu(message: Message, is_change: bool = False):
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🤍 Белый прайс (только безнал)", 
+                    text="🤍 Белый прайс (передача по ЭДО, НДС 22%)", 
                     callback_data="sub_white"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="💳 Общий прайс (наличка + безнал)", 
+                    text="💳 Общий прайс (ВЕСЬ ассортимент)", 
                     callback_data="sub_common"
                 )
             ],
