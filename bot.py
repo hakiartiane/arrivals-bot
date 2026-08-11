@@ -3,6 +3,7 @@ import csv
 import io
 import logging
 import os
+import signal
 import sqlite3
 from contextlib import closing
 from datetime import datetime
@@ -55,7 +56,7 @@ def init_db():
                 username TEXT,
                 full_name TEXT,
                 joined_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                subscription_type TEXT DEFAULT 'common',  -- 'white' or 'common'
+                subscription_type TEXT DEFAULT 'common',
                 is_blocked INTEGER DEFAULT 0
             )
             """
@@ -249,7 +250,7 @@ async def handle_subscription_choice(callback: CallbackQuery):
         parse_mode="Markdown"
     )
     
-    # Удаляем кнопки из старого сообщения
+    # Подтверждаем callback
     await callback.answer()
     
     logger.info(f"New subscriber: {chat_id} ({callback.from_user.full_name}), type: {sub_type}")
@@ -293,7 +294,8 @@ async def cmd_stats(message: Message):
         f"📊 **Статистика подписчиков**\n\n"
         f"👥 Всего: {total}\n"
         f"🤍 Белый прайс: {white}\n"
-        f"💳 Общий прайс: {common}"
+        f"💳 Общий прайс: {common}",
+        parse_mode="Markdown"
     )
 
 
@@ -330,7 +332,8 @@ async def cmd_block_start(message: Message, state: FSMContext):
         "🚫 **Блокировка пользователя**\n\n"
         "Отправьте ID пользователя, которого нужно заблокировать.\n"
         "Чтобы узнать ID, попросите пользователя написать @userinfobot.\n\n"
-        "Для отмены отправьте /cancel"
+        "Для отмены отправьте /cancel",
+        parse_mode="Markdown"
     )
     await state.set_state(BroadcastStates.waiting_block_user)
 
@@ -365,7 +368,8 @@ async def cmd_unblock_start(message: Message, state: FSMContext):
     await message.answer(
         "🔓 **Разблокировка пользователя**\n\n"
         "Отправьте ID пользователя, которого нужно разблокировать.\n\n"
-        "Для отмены отправьте /cancel"
+        "Для отмены отправьте /cancel",
+        parse_mode="Markdown"
     )
     await state.set_state(BroadcastStates.waiting_unblock_user)
 
@@ -416,7 +420,8 @@ async def cmd_white_broadcast(message: Message, state: FSMContext):
         f"👥 Получателей: {count}\n\n"
         f"Отправьте сообщение (текст, фото, видео или файл), "
         f"которое получит каждый подписчик.\n"
-        f"Для отмены отправьте /cancel"
+        f"Для отмены отправьте /cancel",
+        parse_mode="Markdown"
     )
     await state.set_state(BroadcastStates.waiting_white_price)
 
@@ -436,7 +441,8 @@ async def cmd_common_broadcast(message: Message, state: FSMContext):
         f"👥 Получателей: {count}\n\n"
         f"Отправьте сообщение (текст, фото, видео или файл), "
         f"которое получит каждый подписчик.\n"
-        f"Для отмены отправьте /cancel"
+        f"Для отмены отправьте /cancel",
+        parse_mode="Markdown"
     )
     await state.set_state(BroadcastStates.waiting_common_price)
 
@@ -466,17 +472,23 @@ async def process_broadcast_with_confirmation(message: Message, state: FSMContex
     # Сохраняем сообщение и тип
     await state.update_data(source_message=message, sub_type=sub_type)
     
-    # Отправляем превью админу
+    # Сначала отправляем превью админу
     try:
-        preview = await message.copy_to(chat_id=ADMIN_ID)
+        # Отправляем копию сообщения самому админу как превью
+        preview_message = await message.copy_to(chat_id=ADMIN_ID)
+        
+        # Теперь отправляем ответ на это превью с кнопками
         count = count_subscribers(sub_type)
         type_name = "Белый прайс" if sub_type == "white" else "Общий прайс"
         
-        await preview.reply(
-            f"✉️ **Превью рассылки**\n\n"
-            f"📋 Тип: {type_name}\n"
-            f"👥 Получателей: {count}\n"
-            f"⚠️ Отправить это сообщение ВСЕМ подписчикам?",
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                f"✉️ **Превью рассылки**\n\n"
+                f"📋 Тип: {type_name}\n"
+                f"👥 Получателей: {count}\n"
+                f"⚠️ Отправить это сообщение ВСЕМ подписчикам?"
+            ),
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text="✅ Да, отправить всем", callback_data="confirm_broadcast")],
@@ -484,6 +496,7 @@ async def process_broadcast_with_confirmation(message: Message, state: FSMContex
                 ]
             ),
             parse_mode="Markdown",
+            reply_to_message_id=preview_message.message_id  # Привязываем кнопки к превью
         )
     except Exception as e:
         await message.answer(f"❌ Ошибка при создании превью: {e}")
@@ -516,7 +529,7 @@ async def cancel_broadcast(callback: CallbackQuery, state: FSMContext):
 
 
 # ---------- Broadcast logic ----------
-async def broadcast_message(source_message: Message, status_message: Message = None, sub_type: str = None):
+async def broadcast_message(source_message: Message, status_message: Message, sub_type: str = None):
     subscribers = get_all_subscribers(sub_type)
     if not subscribers:
         await status_message.edit_text("ℹ️ Нет подписчиков для рассылки.")
@@ -542,7 +555,8 @@ async def broadcast_message(source_message: Message, status_message: Message = N
                 await status_message.edit_text(
                     f"⏳ Рассылка ({type_name})... {idx}/{total} (отправлено: {sent}, ошибок: {failed})"
                 )
-            except:
+            except Exception as edit_error:
+                logger.warning(f"Could not update status: {edit_error}")
                 pass
         
         await asyncio.sleep(0.05)
@@ -574,14 +588,48 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     logger.info(f"Health-check server running on port {port}")
+    return runner, site
 
+async def shutdown_web_server(runner, site):
+    """Корректно останавливаем веб-сервер"""
+    try:
+        await site.stop()
+        await runner.cleanup()
+        logger.info("Health-check server stopped")
+    except Exception as e:
+        logger.warning(f"Error stopping web server: {e}")
 
 # ---------- Main ----------
 async def main():
     init_db()
     logger.info("🚀 Bot starting...")
-    await start_web_server()
-    await dp.start_polling(bot)
+    
+    # Запускаем веб-сервер
+    runner, site = await start_web_server()
+    
+    # Обработка сигналов для корректного завершения
+    loop = asyncio.get_running_loop()
+    
+    def signal_handler():
+        logger.info("Received shutdown signal, stopping...")
+        asyncio.create_task(shutdown_web_server(runner, site))
+        asyncio.create_task(dp.stop_polling())
+    
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, signal_handler)
+        except NotImplementedError:
+            # Windows не поддерживает add_signal_handler
+            pass
+    
+    # Небольшая задержка перед стартом поллинга
+    await asyncio.sleep(2)
+    logger.info("Starting polling...")
+    
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await shutdown_web_server(runner, site)
 
 if __name__ == "__main__":
     asyncio.run(main())
