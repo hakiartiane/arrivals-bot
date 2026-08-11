@@ -9,7 +9,7 @@ from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import BufferedInputFile, Message
+from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -17,6 +17,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DB_PATH = os.getenv("DB_PATH", "subscribers.db")
+ORDER_URL = "https://b2b.moysklad.ru/public/9p421RcbdoLa"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -84,10 +85,14 @@ async def cmd_start(message: Message):
         message.from_user.username,
         message.from_user.full_name,
     )
+    order_button = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="ОФОРМИТЬ ЗАКАЗ", url=ORDER_URL)]]
+    )
     await message.answer(
         "Вы подписались на рассылку о поступлениях.\n"
         "Здесь будут появляться уведомления о новых поступлениях товара.\n\n"
-        "Чтобы отписаться в любой момент — отправьте /stop."
+        "Чтобы отписаться в любой момент — отправьте /stop.",
+        reply_markup=order_button,
     )
     logger.info(f"New subscriber: {message.chat.id} ({message.from_user.full_name})")
 
