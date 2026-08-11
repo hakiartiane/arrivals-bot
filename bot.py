@@ -104,12 +104,13 @@ def get_subscriber_type(chat_id: int) -> str | None:
 def get_all_subscribers(sub_type: str = None) -> list[int]:
     """Получить подписчиков определенного типа или всех"""
     with closing(sqlite3.connect(DB_PATH)) as conn:
-        if sub_type:
+        if sub_type and sub_type != 'all':
             rows = conn.execute(
                 "SELECT chat_id FROM subscribers WHERE subscription_type = ? AND is_blocked = 0",
                 (sub_type,)
             ).fetchall()
         else:
+            # Для 'all' или None - получаем всех НЕзаблокированных
             rows = conn.execute(
                 "SELECT chat_id FROM subscribers WHERE is_blocked = 0"
             ).fetchall()
@@ -118,14 +119,15 @@ def get_all_subscribers(sub_type: str = None) -> list[int]:
 
 def count_subscribers(sub_type: str = None) -> int:
     with closing(sqlite3.connect(DB_PATH)) as conn:
-        if sub_type:
+        if sub_type and sub_type != 'all':
             return conn.execute(
                 "SELECT COUNT(*) FROM subscribers WHERE subscription_type = ? AND is_blocked = 0",
                 (sub_type,)
             ).fetchone()[0]
-        return conn.execute(
-            "SELECT COUNT(*) FROM subscribers WHERE is_blocked = 0"
-        ).fetchone()[0]
+        else:
+            return conn.execute(
+                "SELECT COUNT(*) FROM subscribers WHERE is_blocked = 0"
+            ).fetchone()[0]
 
 
 def get_all_subscribers_full() -> list[tuple]:
@@ -182,13 +184,13 @@ async def show_subscription_menu(message: Message, is_change: bool = False):
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🤍 Белый прайс (передача по ЭДО, НДС 22%)", 
+                    text="🤍 Белый прайс (только безнал)", 
                     callback_data="sub_white"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="💳 Общий прайс (ВЕСЬ ассортимент)", 
+                    text="💳 Общий прайс (наличка + безнал)", 
                     callback_data="sub_common"
                 )
             ],
@@ -204,8 +206,8 @@ async def show_subscription_menu(message: Message, is_change: bool = False):
     text = (
         "👋 Добро пожаловать!\n\n"
         "Выберите тип подписки:\n\n"
-        "🤍 **Белый прайс** — позиции с передачей по ЭДО\n"
-        "💳 **Общий прайс** — ВЕСЬ ассортимент\n\n"
+        "🤍 **Белый прайс** — только для безналичных расчетов\n"
+        "💳 **Общий прайс** — наличные + безналичные\n\n"
         "Вы всегда можете изменить тип подписки, отправив /start повторно."
     )
     
@@ -238,14 +240,14 @@ async def handle_subscription_choice(callback: CallbackQuery):
     
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📄 Оформить заказ", url=price_url)],
+            [InlineKeyboardButton(text="📄 Открыть прайс", url=price_url)],
             [InlineKeyboardButton(text="📞 Связаться с менеджером", url=MANAGER_LINK)]
         ]
     )
     
     await callback.message.edit_text(
         f"✅ Вы подписались на рассылку **{price_name}**!\n\n"
-        f"📄 Оформить онлайн-заказ можно по ссылке ниже.\n\n"
+        f"📄 Скачать актуальный прайс можно по кнопке ниже.\n\n"
         f"Уведомления о новых поступлениях будут приходить сюда.",
         reply_markup=keyboard,
         parse_mode="Markdown"
@@ -601,7 +603,12 @@ async def cancel_broadcast(callback: CallbackQuery, state: FSMContext):
 
 # ---------- Broadcast logic ----------
 async def broadcast_message(source_message: Message, status_message: Message, sub_type: str = None):
-    subscribers = get_all_subscribers(sub_type)
+    # Получаем подписчиков в зависимости от типа
+    if sub_type == 'all':
+        subscribers = get_all_subscribers()  # Все НЕзаблокированные
+    else:
+        subscribers = get_all_subscribers(sub_type)
+    
     if not subscribers:
         await status_message.edit_text("ℹ️ Нет подписчиков для рассылки.")
         return
@@ -615,6 +622,8 @@ async def broadcast_message(source_message: Message, status_message: Message, su
         type_name = "Белый прайс"
     else:
         type_name = "Общий прайс"
+    
+    logger.info(f"Starting broadcast ({type_name}) to {total} subscribers")
     
     # Обновляем статус каждые 50 отправок
     for idx, chat_id in enumerate(subscribers):
