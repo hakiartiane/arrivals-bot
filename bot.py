@@ -204,8 +204,8 @@ async def show_subscription_menu(message: Message, is_change: bool = False):
     text = (
         "👋 Добро пожаловать!\n\n"
         "Выберите тип подписки:\n\n"
-        "🤍 **Белый прайс** — только для безналичных расчетов\n"
-        "💳 **Общий прайс** — наличные + безналичные\n\n"
+        "🤍 **Белый прайс** — позиции с передачей по ЭДО\n"
+        "💳 **Общий прайс** — ВЕСЬ ассортимент\n\n"
         "Вы всегда можете изменить тип подписки, отправив /start повторно."
     )
     
@@ -238,14 +238,14 @@ async def handle_subscription_choice(callback: CallbackQuery):
     
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📄 Открыть прайс", url=price_url)],
+            [InlineKeyboardButton(text="📄 Оформить заказ", url=price_url)],
             [InlineKeyboardButton(text="📞 Связаться с менеджером", url=MANAGER_LINK)]
         ]
     )
     
     await callback.message.edit_text(
         f"✅ Вы подписались на рассылку **{price_name}**!\n\n"
-        f"📄 Скачать актуальный прайс можно по кнопке ниже.\n\n"
+        f"📄 Оформить онлайн-заказ можно по ссылке ниже.\n\n"
         f"Уведомления о новых поступлениях будут приходить сюда.",
         reply_markup=keyboard,
         parse_mode="Markdown"
