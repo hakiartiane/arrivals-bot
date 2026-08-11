@@ -5,7 +5,6 @@ import logging
 import os
 import signal
 from datetime import datetime
-from urllib.parse import quote_plus
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -25,15 +24,8 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-# Параметры базы данных PostgreSQL (Supabase)
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = os.getenv("DB_PORT", "5432")
-DB_NAME = os.getenv("DB_NAME", "postgres")
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "")
-
-# Собираем URL с экранированием специальных символов
-DATABASE_URL = f"postgresql://{DB_USER}:{quote_plus(DB_PASSWORD)}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+# Используем одну переменную DATABASE_URL
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Ссылки на прайсы
 WHITE_PRICE_URL = "https://b2b.moysklad.ru/public/NgO26OdrxmZh"
@@ -55,8 +47,20 @@ async def init_db():
     """Инициализация базы данных"""
     global db_pool
     try:
-        logger.info(f"Connecting to database at {DB_HOST}:{DB_PORT}/{DB_NAME}")
-        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        if not DATABASE_URL:
+            logger.error("DATABASE_URL not set!")
+            raise ValueError("DATABASE_URL environment variable is required")
+        
+        logger.info(f"Connecting to database...")
+        
+        # Добавляем timeout и другие параметры
+        db_pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=5,
+            timeout=30,
+            command_timeout=30
+        )
         
         async with db_pool.acquire() as conn:
             await conn.execute("""
@@ -162,15 +166,6 @@ async def unblock_user(chat_id: int):
             "UPDATE subscribers SET is_blocked = 0 WHERE chat_id = $1",
             chat_id
         )
-
-
-async def is_user_blocked(chat_id: int) -> bool:
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT is_blocked FROM subscribers WHERE chat_id = $1",
-            chat_id
-        )
-    return row['is_blocked'] == 1 if row else False
 
 
 # ---------- FSM States ----------
