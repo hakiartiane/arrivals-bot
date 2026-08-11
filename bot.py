@@ -46,7 +46,7 @@ supabase: Client = None
 
 # ---------- Database functions ----------
 def init_db():
-    """Инициализация Supabase и создание таблицы"""
+    """Инициализация Supabase"""
     global supabase
     try:
         if not SUPABASE_URL or not SUPABASE_KEY:
@@ -55,35 +55,24 @@ def init_db():
         
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         
-        # Создаем таблицу через SQL (выполняем один раз при запуске)
-        # Используем raw SQL через REST API
-        logger.info("Connected to Supabase successfully")
+        # Проверяем подключение
+        response = supabase.table('subscribers').select('*').limit(1).execute()
+        logger.info("Connected to Supabase successfully, table exists")
         
-        # Пытаемся создать таблицу (если ее нет)
-        try:
-            # Проверяем существование таблицы, создаем если нет
-            response = supabase.table('subscribers').select('*').limit(1).execute()
-            logger.info("Table 'subscribers' exists")
-        except Exception as e:
-            logger.info("Creating table 'subscribers'...")
-            # Таблицу нужно создать вручную через SQL Editor в Supabase
-            # Выполните этот SQL в Supabase SQL Editor:
-            """
-            CREATE TABLE IF NOT EXISTS subscribers (
-                chat_id BIGINT PRIMARY KEY,
-                username TEXT,
-                full_name TEXT,
-                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                subscription_type TEXT DEFAULT 'common',
-                is_blocked INTEGER DEFAULT 0
-            );
-            """
-            logger.warning("Please create table manually in Supabase SQL Editor")
-            raise
-        
-        logger.info("Database initialized successfully")
     except Exception as e:
         logger.error(f"Database initialization error: {e}")
+        logger.error("Please make sure the 'subscribers' table exists in Supabase")
+        logger.error("Run this SQL in Supabase SQL Editor:")
+        logger.error("""
+        CREATE TABLE IF NOT EXISTS subscribers (
+            chat_id BIGINT PRIMARY KEY,
+            username TEXT,
+            full_name TEXT,
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            subscription_type TEXT DEFAULT 'common',
+            is_blocked INTEGER DEFAULT 0
+        );
+        """)
         raise
 
 
