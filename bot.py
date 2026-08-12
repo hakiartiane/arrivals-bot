@@ -57,13 +57,18 @@ async def init_db():
                 chat_id BIGINT PRIMARY KEY,
                 username TEXT,
                 full_name TEXT,
-                joined_at TIMESTAMPTZ DEFAULT NOW(),
-                segment_white BOOLEAN DEFAULT FALSE,
-                segment_general BOOLEAN DEFAULT FALSE,
-                blocked BOOLEAN DEFAULT FALSE
+                joined_at TIMESTAMPTZ DEFAULT NOW()
             )
             """
         )
+        # Migration safety net: patch up tables created before these columns
+        # existed, so redeploys never fail even if the schema grew since.
+        for column, definition in [
+            ("segment_white", "BOOLEAN DEFAULT FALSE"),
+            ("segment_general", "BOOLEAN DEFAULT FALSE"),
+            ("blocked", "BOOLEAN DEFAULT FALSE"),
+        ]:
+            await conn.execute(f"ALTER TABLE subscribers ADD COLUMN IF NOT EXISTS {column} {definition}")
 
 
 async def add_subscriber(chat_id: int, username: str | None, full_name: str):
