@@ -3,369 +3,406 @@ import csv
 import io
 import logging
 import os
-from datetime import datetime
-
+import signal
 import asyncpg
+from datetime import datetime
+from contextlib import asynccontextmanager
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    BufferedInputFile,
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
+    BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup,
+    Message, CallbackQuery
 )
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
+from aiohttp import web
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
-ORDER_URL = "https://b2b.moysklad.ru/public/9p421RcbdoLa"
+
+# Ссылки на прайсы
 WHITE_PRICE_URL = "https://b2b.moysklad.ru/public/NgO26OdrxmZh"
-GENERAL_PRICE_URL = "https://b2b.moysklad.ru/public/9p421RcbdoLa"
-MANAGER_USERNAME = "vv_vape"
+COMMON_PRICE_URL = "https://b2b.moysklad.ru/public/9p421RcbdoLa"
+MANAGER_LINK = "https://t.me/vv_vape"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 
-# Postgres connection pool, created once in main() before polling starts.
-pool: asyncpg.Pool | None = None
-
-# In-memory admin state: which segment the admin is about to broadcast to.
-# Reset after each broadcast or with /cancel. Resets to None on service restart.
-admin_broadcast_target: str | None = None
-
-# Holds a broadcast waiting on admin confirmation after preview.
-# {'message': Message, 'target': str} or None.
-pending_broadcast: dict | None = None
+# Глобальный пул соединений с БД
+db_pool: asyncpg.Pool = None
 
 
-# ---------- Database (Supabase Postgres via asyncpg) ----------
-
+# ---------- Database Functions ----------
 async def init_db():
-    global pool
-    pool = await asyncpg.create_pool(dsn=DATABASE_URL, ssl="require", min_size=1, max_size=5)
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS subscribers (
-                chat_id BIGINT PRIMARY KEY,
-                username TEXT,
-                full_name TEXT,
-                joined_at TIMESTAMPTZ DEFAULT NOW()
-            )
-            """
+    """Инициализация пула соединений и создание таблицы, если её нет."""
+    global db_pool
+    try:
+        if not DATABASE_URL:
+            raise ValueError("DATABASE_URL environment variable is not set.")
+
+        logger.info("Connecting to the database via DATABASE_URL...")
+        db_pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=5,
+            timeout=30,
+            command_timeout=30
         )
-        # Migration safety net: patch up tables created before these columns
-        # existed, so redeploys never fail even if the schema grew since.
-        for column, definition in [
-            ("segment_white", "BOOLEAN DEFAULT FALSE"),
-            ("segment_general", "BOOLEAN DEFAULT FALSE"),
-            ("blocked", "BOOLEAN DEFAULT FALSE"),
-        ]:
-            await conn.execute(f"ALTER TABLE subscribers ADD COLUMN IF NOT EXISTS {column} {definition}")
+
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS subscribers (
+                    chat_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    full_name TEXT,
+                    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    subscription_type TEXT DEFAULT 'common',
+                    is_blocked INTEGER DEFAULT 0
+                )
+            """)
+        logger.info("Database initialized successfully.")
+    except Exception as e:
+        logger.error(f"Database initialization error: {e}")
+        raise
 
 
-async def add_subscriber(chat_id: int, username: str | None, full_name: str):
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO subscribers (chat_id, username, full_name) VALUES ($1, $2, $3) "
-            "ON CONFLICT (chat_id) DO NOTHING",
-            chat_id, username, full_name,
-        )
+# --- Helpers for asyncpg ---
+async def add_subscriber(chat_id: int, username: str | None, full_name: str, sub_type: str = 'common'):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO subscribers (chat_id, username, full_name, subscription_type, is_blocked) 
+            VALUES ($1, $2, $3, $4, 0)
+            ON CONFLICT (chat_id) DO UPDATE SET 
+                username = $2, 
+                full_name = $3, 
+                subscription_type = $4
+        """, chat_id, username, full_name, sub_type)
 
 
 async def remove_subscriber(chat_id: int):
-    async with pool.acquire() as conn:
+    async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM subscribers WHERE chat_id = $1", chat_id)
 
 
-async def set_segment(chat_id: int, segment: str, value: bool):
-    column = "segment_white" if segment == "white" else "segment_general"
-    async with pool.acquire() as conn:
-        await conn.execute(f"UPDATE subscribers SET {column} = $1 WHERE chat_id = $2", value, chat_id)
+async def get_subscriber_type(chat_id: int) -> str | None:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT subscription_type FROM subscribers WHERE chat_id = $1", chat_id)
+    return row['subscription_type'] if row else None
 
 
-async def get_segments(chat_id: int) -> tuple[bool, bool]:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT segment_white, segment_general FROM subscribers WHERE chat_id = $1", chat_id
-        )
-    if not row:
-        return False, False
-    return bool(row["segment_white"]), bool(row["segment_general"])
+async def get_all_subscribers(sub_type: str = None) -> list[int]:
+    async with db_pool.acquire() as conn:
+        if sub_type and sub_type != 'all':
+            rows = await conn.fetch("SELECT chat_id FROM subscribers WHERE subscription_type = $1 AND is_blocked = 0", sub_type)
+        else:
+            rows = await conn.fetch("SELECT chat_id FROM subscribers WHERE is_blocked = 0")
+    return [row['chat_id'] for row in rows]
 
 
-async def set_blocked(chat_id: int, blocked: bool) -> bool:
-    async with pool.acquire() as conn:
-        result = await conn.execute("UPDATE subscribers SET blocked = $1 WHERE chat_id = $2", blocked, chat_id)
-    return result.endswith(" 1")  # "UPDATE 1" means one row matched
+async def count_subscribers(sub_type: str = None) -> int:
+    async with db_pool.acquire() as conn:
+        if sub_type and sub_type != 'all':
+            return await conn.fetchval("SELECT COUNT(*) FROM subscribers WHERE subscription_type = $1 AND is_blocked = 0", sub_type)
+        return await conn.fetchval("SELECT COUNT(*) FROM subscribers WHERE is_blocked = 0")
 
 
-async def get_subscribers_by_segment(segment: str) -> list[int]:
-    column = "segment_white" if segment == "white" else "segment_general"
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(f"SELECT chat_id FROM subscribers WHERE {column} = TRUE AND blocked = FALSE")
-    return [row["chat_id"] for row in rows]
+async def get_all_subscribers_full() -> list[dict]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT chat_id, username, full_name, joined_at, subscription_type FROM subscribers ORDER BY joined_at")
+    return [dict(row) for row in rows]
 
 
-async def get_all_subscribers() -> list[int]:
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT chat_id FROM subscribers WHERE blocked = FALSE")
-    return [row["chat_id"] for row in rows]
+async def block_user(chat_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE subscribers SET is_blocked = 1 WHERE chat_id = $1", chat_id)
 
 
-async def count_subscribers() -> int:
-    async with pool.acquire() as conn:
-        return await conn.fetchval("SELECT COUNT(*) FROM subscribers WHERE blocked = FALSE")
+async def unblock_user(chat_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE subscribers SET is_blocked = 0 WHERE chat_id = $1", chat_id)
 
 
-async def get_all_subscribers_full() -> list[tuple]:
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT chat_id, username, full_name, joined_at, segment_white, segment_general, blocked "
-            "FROM subscribers ORDER BY joined_at"
-        )
-    return [tuple(row) for row in rows]
+# ---------- FSM States ----------
+class BroadcastStates(StatesGroup):
+    waiting_white_price = State()
+    waiting_common_price = State()
+    waiting_all_price = State()
+    waiting_block_user = State()
+    waiting_unblock_user = State()
 
 
-# ---------- Client-facing handlers ----------
-
-def segment_keyboard(white: bool, general: bool) -> InlineKeyboardMarkup:
-    white_label = ("✅ " if white else "⬜ ") + "Белый прайс"
-    general_label = ("✅ " if general else "⬜ ") + "Общий прайс"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=white_label, callback_data="toggle_white")],
-            [InlineKeyboardButton(text=general_label, callback_data="toggle_general")],
-            [InlineKeyboardButton(text="Готово ✅", callback_data="confirm_segments")],
-        ]
-    )
-
-
+# ---------- Client Handlers ----------
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    await add_subscriber(
-        message.chat.id,
-        message.from_user.username,
-        message.from_user.full_name,
-    )
-    await set_blocked(message.chat.id, False)
+    existing_type = await get_subscriber_type(message.chat.id)
+    await show_subscription_menu(message, is_change=bool(existing_type))
 
-    welcome_keyboard = InlineKeyboardMarkup(
+
+async def show_subscription_menu(message: Message, is_change: bool = False):
+    keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="ОФОРМИТЬ ЗАКАЗ", url=ORDER_URL)],
-            [InlineKeyboardButton(text="Написать менеджеру", url=f"https://t.me/{MANAGER_USERNAME}")],
+            [InlineKeyboardButton(text="🤍 Белый прайс (только безнал)", callback_data="sub_white")],
+            [InlineKeyboardButton(text="💳 Общий прайс (наличка + безнал)", callback_data="sub_common")],
+            [InlineKeyboardButton(text="📞 Связаться с менеджером", url=MANAGER_LINK)]
         ]
     )
-    await message.answer(
-        "Вы подписались на рассылку о поступлениях.\n"
-        "Здесь будут появляться уведомления о новых поступлениях товара.\n\n"
-        f"Связаться с менеджером: @{MANAGER_USERNAME}\n\n"
-        "Чтобы отписаться в любой момент — отправьте /stop.",
-        reply_markup=welcome_keyboard,
+    text = "👋 Добро пожаловать!\n\nВыберите тип подписки:\n\n🤍 **Белый прайс** — только для безналичных расчетов\n💳 **Общий прайс** — наличные + безналичные\n\nВы всегда можете изменить тип подписки, отправив /start повторно."
+    if is_change:
+        text = "🔄 **Изменить тип подписки**\n\n" + text
+    await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+
+
+@dp.callback_query(F.data.startswith("sub_"))
+async def handle_subscription_choice(callback: CallbackQuery):
+    sub_type = callback.data.split("_")[1]
+    chat_id = callback.from_user.id
+    await add_subscriber(chat_id, callback.from_user.username, callback.from_user.full_name, sub_type)
+
+    price_url = WHITE_PRICE_URL if sub_type == "white" else COMMON_PRICE_URL
+    price_name = "Белый прайс" if sub_type == "white" else "Общий прайс"
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📄 Открыть прайс", url=price_url)],
+            [InlineKeyboardButton(text="📞 Связаться с менеджером", url=MANAGER_LINK)]
+        ]
     )
-
-    white, general = await get_segments(message.chat.id)
-    await message.answer(
-        "Выберите, какие прайсы вас интересуют (можно выбрать оба):",
-        reply_markup=segment_keyboard(white, general),
-    )
-    logger.info(f"New subscriber: {message.chat.id} ({message.from_user.full_name})")
-
-
-@dp.callback_query(F.data.in_(["toggle_white", "toggle_general"]))
-async def cb_toggle_segment(callback: CallbackQuery):
-    segment = "white" if callback.data == "toggle_white" else "general"
-    white, general = await get_segments(callback.message.chat.id)
-    current = white if segment == "white" else general
-    await set_segment(callback.message.chat.id, segment, not current)
-    white, general = await get_segments(callback.message.chat.id)
-    await callback.message.edit_reply_markup(reply_markup=segment_keyboard(white, general))
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "confirm_segments")
-async def cb_confirm_segments(callback: CallbackQuery):
-    white, general = await get_segments(callback.message.chat.id)
-    if not white and not general:
-        await callback.answer("Выберите хотя бы один прайс", show_alert=True)
-        return
-
-    buttons = []
-    if white:
-        buttons.append([InlineKeyboardButton(text="Открыть белый прайс", url=WHITE_PRICE_URL)])
-    if general:
-        buttons.append([InlineKeyboardButton(text="Открыть общий прайс", url=GENERAL_PRICE_URL)])
-
     await callback.message.edit_text(
-        "Подписка сохранена. Каталоги:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        f"✅ Вы подписались на рассылку **{price_name}**!\n\n📄 Скачать актуальный прайс можно по кнопке ниже.\n\nУведомления о новых поступлениях будут приходить сюда.",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
     )
-    await callback.answer("Готово")
+    await callback.answer()
+    logger.info(f"New subscriber: {chat_id} ({callback.from_user.full_name}), type: {sub_type}")
 
 
 @dp.message(Command("stop"))
 async def cmd_stop(message: Message):
     await remove_subscriber(message.chat.id)
-    await message.answer("Вы отписались от рассылки. Чтобы вернуться — отправьте /start.")
+    await message.answer(
+        "❌ Вы отписались от рассылки.\n\nЧтобы вернуться — отправьте /start.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Подписаться снова", callback_data="resubscribe")]])
+    )
 
 
-# ---------- Admin-facing handlers ----------
+@dp.callback_query(F.data == "resubscribe")
+async def resubscribe(callback: CallbackQuery):
+    await callback.answer()
+    await show_subscription_menu(callback.message, is_change=False)
 
+
+# ---------- Admin Handlers ----------
 def is_admin(message: Message) -> bool:
     return message.from_user.id == ADMIN_ID
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
-    if is_admin(message):
-        await message.answer(
-            "Команды администратора:\n"
-            "/white — рассылка по Белому прайсу (уходит всем подписчикам)\n"
-            "/common — рассылка по Общему прайсу (только тем, кто выбрал его)\n"
-            "/all — рассылка абсолютно всем подписчикам\n"
-            "/stats — статистика подписчиков\n"
-            "/export — выгрузить базу подписчиков в CSV\n"
-            "/block <chat_id> — заблокировать подписчика\n"
-            "/unblock <chat_id> — разблокировать подписчика\n"
-            "/cancel — отменить текущее действие (ввод рассылки или ожидание подтверждения)"
-        )
-    else:
-        await message.answer(
-            "/start — подписаться и выбрать тип рассылки\n"
-            "/stop — отписаться от рассылки"
-        )
+    if not is_admin(message):
+        return await message.answer("📋 /start — Выбрать тип подписки\n/stop — Отписаться")
+    await message.answer(
+        "📋 **Список всех команд:**\n\n**Для клиентов:**\n/start — Выбрать тип подписки\n/stop — Отписаться\n\n**Для админа:**\n/help — Помощь\n/stats — Статистика\n/white — Рассылка для Белого прайса\n/common — Рассылка для Общего прайса\n/all — Рассылка для ВСЕХ\n/block — Заблокировать\n/unblock — Разблокировать\n/export — Экспорт базы\n/cancel — Отменить действие",
+        parse_mode="Markdown"
+    )
 
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
-    if not is_admin(message):
-        return
-    general_count = len(await get_subscribers_by_segment("general"))
-    total = await count_subscribers()
-    await message.answer(
-        f"Всего подписчиков: {total}\n"
-        f"— Из них «Общий прайс»: {general_count}\n"
-        f"(«Белый прайс» уходит всем подписчикам без исключений)"
-    )
+    if not is_admin(message): return
+    total, white, common = await count_subscribers(), await count_subscribers('white'), await count_subscribers('common')
+    await message.answer(f"📊 **Статистика**\n\n👥 Всего: {total}\n🤍 Белый: {white}\n💳 Общий: {common}", parse_mode="Markdown")
 
 
 @dp.message(Command("export"))
 async def cmd_export(message: Message):
-    if not is_admin(message):
-        return
-
+    if not is_admin(message): return
     rows = await get_all_subscribers_full()
     if not rows:
-        await message.answer("Пока нет ни одного подписчика.")
-        return
-
+        return await message.answer("ℹ️ Нет подписчиков.")
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(
-        ["chat_id", "username", "full_name", "joined_at", "segment_white", "segment_general", "blocked"]
-    )
-    writer.writerows(rows)
-
+    writer.writerow(["chat_id", "username", "full_name", "joined_at", "subscription_type"])
+    for row in rows:
+        writer.writerow([row['chat_id'], row['username'], row['full_name'], row['joined_at'], row['subscription_type']])
     file_bytes = buffer.getvalue().encode("utf-8-sig")
-    filename = f"subscribers_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-
-    await message.answer_document(
-        BufferedInputFile(file_bytes, filename=filename),
-        caption=f"Бэкап подписчиков: {len(rows)} записей",
-    )
+    await message.answer_document(BufferedInputFile(file_bytes, filename=f"subscribers_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"), caption=f"📁 Бэкап: {len(rows)} записей")
 
 
+# --- Block/Unblock ---
 @dp.message(Command("block"))
-async def cmd_block(message: Message):
-    if not is_admin(message):
+async def cmd_block_start(message: Message, state: FSMContext):
+    if not is_admin(message): return
+    await message.answer("🚫 Отправьте ID пользователя для блокировки.\nДля отмены /cancel")
+    await state.set_state(BroadcastStates.waiting_block_user)
+
+
+@dp.message(BroadcastStates.waiting_block_user)
+async def process_block_user(message: Message, state: FSMContext):
+    if not is_admin(message): return
+    try:
+        user_id = int(message.text.strip())
+    except ValueError:
+        return await message.answer("❌ Некорректный ID.")
+    if not await get_subscriber_type(user_id):
+        await message.answer(f"❌ Пользователь {user_id} не найден.")
+        await state.clear()
         return
-    parts = message.text.split()
-    if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
-        await message.answer("Использование: /block <chat_id>\nchat_id можно взять из /export")
-        return
-    chat_id = int(parts[1])
-    if await set_blocked(chat_id, True):
-        await message.answer(f"Пользователь {chat_id} исключён из рассылок.")
-    else:
-        await message.answer("Такого подписчика не найдено.")
+    await block_user(user_id)
+    await message.answer(f"✅ Пользователь {user_id} заблокирован.")
+    await state.clear()
 
 
 @dp.message(Command("unblock"))
-async def cmd_unblock(message: Message):
-    if not is_admin(message):
+async def cmd_unblock_start(message: Message, state: FSMContext):
+    if not is_admin(message): return
+    await message.answer("🔓 Отправьте ID пользователя для разблокировки.\nДля отмены /cancel")
+    await state.set_state(BroadcastStates.waiting_unblock_user)
+
+
+@dp.message(BroadcastStates.waiting_unblock_user)
+async def process_unblock_user(message: Message, state: FSMContext):
+    if not is_admin(message): return
+    try:
+        user_id = int(message.text.strip())
+    except ValueError:
+        return await message.answer("❌ Некорректный ID.")
+    if not await get_subscriber_type(user_id):
+        await message.answer(f"❌ Пользователь {user_id} не найден.")
+        await state.clear()
         return
-    parts = message.text.split()
-    if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
-        await message.answer("Использование: /unblock <chat_id>")
-        return
-    chat_id = int(parts[1])
-    if await set_blocked(chat_id, False):
-        await message.answer(f"Пользователь {chat_id} снова получает рассылки.")
-    else:
-        await message.answer("Такого подписчика не найдено.")
-
-
-@dp.message(Command("common"))
-async def cmd_broadcast_general(message: Message):
-    if not is_admin(message):
-        return
-    global admin_broadcast_target
-    admin_broadcast_target = "general"
-    count = len(await get_subscribers_by_segment("general"))
-    await message.answer(
-        f"Жду сообщение для рассылки по «Общему прайсу» ({count} получателей).\n"
-        "Пришлите текст, фото или документ следующим сообщением. Отменить — /cancel"
-    )
-
-
-@dp.message(Command("white"))
-async def cmd_broadcast_white(message: Message):
-    if not is_admin(message):
-        return
-    global admin_broadcast_target
-    admin_broadcast_target = "white"
-    count = await count_subscribers()
-    await message.answer(
-        f"Жду сообщение для рассылки по «Белому прайсу» — уйдёт ВСЕМ подписчикам ({count} получателей).\n"
-        "Пришлите текст, фото или документ следующим сообщением. Отменить — /cancel"
-    )
-
-
-@dp.message(Command("all"))
-async def cmd_broadcast_all(message: Message):
-    if not is_admin(message):
-        return
-    global admin_broadcast_target
-    admin_broadcast_target = "all"
-    count = await count_subscribers()
-    await message.answer(
-        f"Жду сообщение для рассылки всем подписчикам ({count} получателей).\n"
-        "Пришлите текст, фото или документ следующим сообщением. Отменить — /cancel"
-    )
+    await unblock_user(user_id)
+    await message.answer(f"✅ Пользователь {user_id} разблокирован.")
+    await state.clear()
 
 
 @dp.message(Command("cancel"))
-async def cmd_cancel(message: Message):
-    if not is_admin(message):
+async def cmd_cancel(message: Message, state: FSMContext):
+    if not is_admin(message): return
+    await state.clear()
+    await message.answer("❌ Отменено.")
+
+
+# ---------- Broadcast Commands ----------
+@dp.message(Command("white"))
+async def cmd_white_broadcast(message: Message, state: FSMContext):
+    if not is_admin(message): return
+    count = await count_subscribers('white')
+    if count == 0:
+        return await message.answer("ℹ️ Нет подписчиков на Белый прайс.")
+    await message.answer(f"🤍 **Белый прайс**\n👥 Получателей: {count}\n\nОтправьте сообщение для рассылки.\nДля отмены /cancel", parse_mode="Markdown")
+    await state.set_state(BroadcastStates.waiting_white_price)
+
+
+@dp.message(Command("common"))
+async def cmd_common_broadcast(message: Message, state: FSMContext):
+    if not is_admin(message): return
+    count = await count_subscribers('common')
+    if count == 0:
+        return await message.answer("ℹ️ Нет подписчиков на Общий прайс.")
+    await message.answer(f"💳 **Общий прайс**\n👥 Получателей: {count}\n\nОтправьте сообщение для рассылки.\nДля отмены /cancel", parse_mode="Markdown")
+    await state.set_state(BroadcastStates.waiting_common_price)
+
+
+@dp.message(Command("all"))
+async def cmd_all_broadcast(message: Message, state: FSMContext):
+    if not is_admin(message): return
+    total = await count_subscribers()
+    if total == 0:
+        return await message.answer("ℹ️ Нет подписчиков.")
+    white, common = await count_subscribers('white'), await count_subscribers('common')
+    await message.answer(f"📢 **ВСЕМ подписчикам**\n\n👥 Всего: {total}\n🤍 Белый: {white}\n💳 Общий: {common}\n\nОтправьте сообщение для рассылки.\nДля отмены /cancel", parse_mode="Markdown")
+    await state.set_state(BroadcastStates.waiting_all_price)
+
+
+# ---------- Broadcast Processing ----------
+@dp.message(BroadcastStates.waiting_white_price)
+async def process_white_broadcast(message: Message, state: FSMContext):
+    if not is_admin(message): return
+    await process_broadcast_with_confirmation(message, state, 'white')
+
+
+@dp.message(BroadcastStates.waiting_common_price)
+async def process_common_broadcast(message: Message, state: FSMContext):
+    if not is_admin(message): return
+    await process_broadcast_with_confirmation(message, state, 'common')
+
+
+@dp.message(BroadcastStates.waiting_all_price)
+async def process_all_broadcast(message: Message, state: FSMContext):
+    if not is_admin(message): return
+    await process_broadcast_with_confirmation(message, state, 'all')
+
+
+async def process_broadcast_with_confirmation(message: Message, state: FSMContext, sub_type: str):
+    if not any([message.text, message.photo, message.video, message.document, message.audio, message.voice]):
+        return await message.answer("ℹ️ Отправьте текст, фото, видео или файл.")
+    await state.update_data(source_message=message, sub_type=sub_type)
+
+    try:
+        preview_message = await message.copy_to(chat_id=ADMIN_ID)
+        if sub_type == 'all':
+            count = await count_subscribers()
+            type_name = "ВСЕХ"
+            detail = f"🤍 Белый: {await count_subscribers('white')}, 💳 Общий: {await count_subscribers('common')}"
+        else:
+            count = await count_subscribers(sub_type)
+            type_name = "Белый прайс" if sub_type == "white" else "Общий прайс"
+            detail = ""
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"✉️ **Превью**\n\n📋 Тип: {type_name}\n👥 Получателей: {count}\n{detail}\n\n⚠️ Отправить?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Да", callback_data="confirm_broadcast")],
+                [InlineKeyboardButton(text="❌ Нет", callback_data="cancel_broadcast")]
+            ]),
+            parse_mode="Markdown",
+            reply_to_message_id=preview_message.message_id
+        )
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+        await state.clear()
+
+
+@dp.callback_query(F.data == "confirm_broadcast")
+async def confirm_broadcast(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    data = await state.get_data()
+    source_message = data.get("source_message")
+    sub_type = data.get("sub_type")
+    if not source_message:
+        await callback.message.edit_text("❌ Ошибка.")
+        await state.clear()
         return
-    global admin_broadcast_target, pending_broadcast
-    admin_broadcast_target = None
-    pending_broadcast = None
-    await message.answer("Отменено.")
+    await callback.message.edit_text("⏳ Запускаю...")
+    await broadcast_message(source_message, callback.message, sub_type)
+    await state.clear()
 
 
-async def broadcast_message(source_message: Message, chat_ids: list[int]):
-    sent, failed = 0, 0
-    status = await bot.send_message(ADMIN_ID, f"Рассылка запущена: {len(chat_ids)} получателей...")
+@dp.callback_query(F.data == "cancel_broadcast")
+async def cancel_broadcast(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.edit_text("❌ Отменено.")
+    await state.clear()
 
-    for chat_id in chat_ids:
+
+async def broadcast_message(source_message: Message, status_message: Message, sub_type: str = None):
+    subscribers = await get_all_subscribers(sub_type)
+    if not subscribers:
+        return await status_message.edit_text("ℹ️ Нет подписчиков.")
+    sent, failed, total = 0, 0, len(subscribers)
+    type_name = "ВСЕХ" if sub_type == 'all' else ("Белый" if sub_type == 'white' else "Общий")
+
+    for idx, chat_id in enumerate(subscribers):
         try:
             await source_message.copy_to(chat_id)
             sent += 1
@@ -374,109 +411,23 @@ async def broadcast_message(source_message: Message, chat_ids: list[int]):
             logger.warning(f"Failed to send to {chat_id}: {e}")
             if "bot was blocked" in str(e).lower() or "chat not found" in str(e).lower():
                 await remove_subscriber(chat_id)
-        await asyncio.sleep(0.05)  # ~20 messages/sec, safely under Telegram limits
+        if idx % 50 == 0:
+            try:
+                await status_message.edit_text(f"⏳ {idx}/{total} (отправлено: {sent}, ошибок: {failed})")
+            except:
+                pass
+        await asyncio.sleep(0.05)
 
-    await bot.edit_message_text(
-        f"Рассылка завершена.\nОтправлено: {sent}\nНе доставлено: {failed}",
-        chat_id=ADMIN_ID,
-        message_id=status.message_id,
+    await status_message.edit_text(
+        f"✅ **Готово**\n\n📋 Тип: {type_name}\n📤 Отправлено: {sent}\n⚠️ Ошибок: {failed}\n📊 Всего: {total}",
+        parse_mode="Markdown"
     )
+    logger.info(f"Broadcast ({sub_type}) finished: sent={sent}, failed={failed}, total={total}")
 
 
-# This bot exists only to broadcast — so, once the admin has picked a target
-# with /common, /white, or /all, the very next non-command message they send
-# is treated as the content to broadcast. Instead of sending immediately, it's
-# shown back to the admin as a preview with Confirm/Cancel buttons.
-@dp.message(F.chat.id == ADMIN_ID)
-async def admin_message_router(message: Message):
-    global admin_broadcast_target, pending_broadcast
-
-    if message.text and message.text.startswith("/"):
-        return
-
-    if admin_broadcast_target is None:
-        await message.answer(
-            "Сначала выберите, кому рассылаем:\n"
-            "/common — подписчикам общего прайса\n"
-            "/white — всем подписчикам (белый прайс)\n"
-            "/all — всем подписчикам"
-        )
-        return
-
-    target = admin_broadcast_target
-    admin_broadcast_target = None
-    pending_broadcast = {"message": message, "target": target}
-
-    if target == "all":
-        count = await count_subscribers()
-        label = "ВСЕМ подписчикам"
-    elif target == "white":
-        count = await count_subscribers()
-        label = "Белому прайсу (всем подписчикам)"
-    else:
-        count = len(await get_subscribers_by_segment("general"))
-        label = "Общему прайсу"
-
-    await message.answer("👀 Превью — так сообщение увидят получатели:")
-    await message.copy_to(ADMIN_ID)
-    await message.answer(
-        f"Разослать по «{label}»? Получателей: {count}",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="✅ Отправить", callback_data="confirm_broadcast"),
-                    InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_broadcast"),
-                ]
-            ]
-        ),
-    )
-
-
-@dp.callback_query(F.data == "confirm_broadcast")
-async def cb_confirm_broadcast(callback: CallbackQuery):
-    global pending_broadcast
-    if callback.from_user.id != ADMIN_ID:
-        return
-    if pending_broadcast is None:
-        await callback.answer("Нечего отправлять — начните заново с /white, /common или /all", show_alert=True)
-        return
-
-    target = pending_broadcast["target"]
-    source_message = pending_broadcast["message"]
-    pending_broadcast = None
-
-    if target in ("all", "white"):
-        chat_ids = await get_all_subscribers()
-    else:
-        chat_ids = await get_subscribers_by_segment("general")
-
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.answer("Рассылка запущена")
-    await broadcast_message(source_message, chat_ids)
-
-
-@dp.callback_query(F.data == "cancel_broadcast")
-async def cb_cancel_broadcast(callback: CallbackQuery):
-    global pending_broadcast
-    if callback.from_user.id != ADMIN_ID:
-        return
-    pending_broadcast = None
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.answer("Отменено")
-
-
-# ---------- HTTP health-check (for Render + UptimeRobot) ----------
-# The bot itself talks to Telegram via polling and has no URL of its own.
-# This tiny web server exists only so Render can bind a port (required for
-# its free Web Service tier) and so UptimeRobot has something to ping to
-# keep the service from spinning down.
-
-from aiohttp import web
-
-
+# ---------- Health-check ----------
 async def health_check(request):
     return web.Response(text="OK")
-
 
 async def start_web_server():
     app = web.Application()
@@ -486,15 +437,44 @@ async def start_web_server():
     port = int(os.getenv("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"Health-check server listening on port {port}")
+    logger.info(f"Health-check running on port {port}")
+    return runner, site
+
+async def shutdown_web_server(runner, site):
+    try:
+        await site.stop()
+        await runner.cleanup()
+        logger.info("Health-check stopped")
+    except Exception as e:
+        logger.warning(f"Error stopping web server: {e}")
 
 
+# ---------- Main ----------
 async def main():
     await init_db()
-    logger.info("Bot starting...")
-    await start_web_server()
-    await dp.start_polling(bot)
+    logger.info("🚀 Bot starting...")
+    runner, site = await start_web_server()
 
+    loop = asyncio.get_running_loop()
+    def signal_handler():
+        logger.info("Received shutdown signal...")
+        asyncio.create_task(shutdown_web_server(runner, site))
+        asyncio.create_task(dp.stop_polling())
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, signal_handler)
+        except NotImplementedError:
+            pass
+
+    await asyncio.sleep(2)
+    logger.info("Starting polling...")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await shutdown_web_server(runner, site)
+        if db_pool:
+            await db_pool.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
