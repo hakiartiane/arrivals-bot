@@ -158,7 +158,7 @@ async def show_subscription_menu(message: Message, is_change: bool = False):
     )
     text = "👋 Добро пожаловать!\n\nВыберите тип подписки:\n\n🤍 **Белый прайс** \n💳 **Общий прайс**\n\nВы всегда можете изменить тип подписки, отправив /start повторно."
     if is_change:
-        text = "🔄 **Изменить тип подписки**\n\n" + text
+        text = "🔄 **Выбрать тип подписки**\n\n" + text
     await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
 
 
