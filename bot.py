@@ -151,12 +151,12 @@ async def cmd_start(message: Message):
 async def show_subscription_menu(message: Message, is_change: bool = False):
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🤍 Белый прайс (только безнал)", callback_data="sub_white")],
-            [InlineKeyboardButton(text="💳 Общий прайс (наличка + безнал)", callback_data="sub_common")],
+            [InlineKeyboardButton(text="🤍 Белый прайс (передача по ЭДО, НДС 22%)", callback_data="sub_white")],
+            [InlineKeyboardButton(text="💳 Общий прайс (ВЕСЬ ассортимент)", callback_data="sub_common")],
             [InlineKeyboardButton(text="📞 Связаться с менеджером", url=MANAGER_LINK)]
         ]
     )
-    text = "👋 Добро пожаловать!\n\nВыберите тип подписки:\n\n🤍 **Белый прайс** — только для безналичных расчетов\n💳 **Общий прайс** — наличные + безналичные\n\nВы всегда можете изменить тип подписки, отправив /start повторно."
+    text = "👋 Добро пожаловать!\n\nВыберите тип подписки:\n\n🤍 **Белый прайс** \n💳 **Общий прайс**\n\nВы всегда можете изменить тип подписки, отправив /start повторно."
     if is_change:
         text = "🔄 **Изменить тип подписки**\n\n" + text
     await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
@@ -173,12 +173,12 @@ async def handle_subscription_choice(callback: CallbackQuery):
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📄 Открыть прайс", url=price_url)],
+            [InlineKeyboardButton(text="📄 ОНЛАЙН-ЗАКАЗ", url=price_url)],
             [InlineKeyboardButton(text="📞 Связаться с менеджером", url=MANAGER_LINK)]
         ]
     )
     await callback.message.edit_text(
-        f"✅ Вы подписались на рассылку **{price_name}**!\n\n📄 Скачать актуальный прайс можно по кнопке ниже.\n\nУведомления о новых поступлениях будут приходить сюда.",
+        f"✅ Вы подписались на рассылку **{price_name}**!\n\n📄 Оформить заказ онлайн можно по кнопке ниже.\n\nУведомления о новых поступлениях будут приходить сюда.",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
