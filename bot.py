@@ -145,6 +145,21 @@ class BroadcastStates(StatesGroup):
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     existing_type = await get_subscriber_type(message.chat.id)
+
+    if message.chat.id != ADMIN_ID:
+        username_part = f"@{message.from_user.username}" if message.from_user.username else "нет username"
+        status = "уже был подписан" if existing_type else "впервые"
+        notify_text = (
+            f"▶️ Запуск бота (/start)\n\n"
+            f"👤 {message.from_user.full_name} ({username_part})\n"
+            f"🆔 ID: {message.chat.id}\n"
+            f"ℹ️ {status}"
+        )
+        try:
+            await bot.send_message(chat_id=ADMIN_ID, text=notify_text)
+        except Exception as e:
+            logger.warning(f"Failed to notify admin about /start from {message.chat.id}: {e}")
+
     await show_subscription_menu(message, is_change=bool(existing_type))
 
 
