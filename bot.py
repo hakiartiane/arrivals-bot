@@ -166,7 +166,31 @@ async def show_subscription_menu(message: Message, is_change: bool = False):
 async def handle_subscription_choice(callback: CallbackQuery):
     sub_type = callback.data.split("_")[1]
     chat_id = callback.from_user.id
+    previous_type = await get_subscriber_type(chat_id)
     await add_subscriber(chat_id, callback.from_user.username, callback.from_user.full_name, sub_type)
+
+    # Уведомление админу о новой подписке / смене типа
+    if chat_id != ADMIN_ID:
+        username_part = f"@{callback.from_user.username}" if callback.from_user.username else "нет username"
+        type_name = "Белый прайс" if sub_type == "white" else "Общий прайс"
+        if previous_type is None:
+            notify_text = (
+                f"🆕 Новый подписчик!\n\n"
+                f"👤 {callback.from_user.full_name} ({username_part})\n"
+                f"🆔 ID: {chat_id}\n"
+                f"📋 Тип: {type_name}"
+            )
+        else:
+            notify_text = (
+                f"🔄 Подписчик сменил тип рассылки\n\n"
+                f"👤 {callback.from_user.full_name} ({username_part})\n"
+                f"🆔 ID: {chat_id}\n"
+                f"📋 Было: {'Белый прайс' if previous_type == 'white' else 'Общий прайс'} → Стало: {type_name}"
+            )
+        try:
+            await bot.send_message(chat_id=ADMIN_ID, text=notify_text)
+        except Exception as e:
+            logger.warning(f"Failed to notify admin about new subscriber {chat_id}: {e}")
 
     price_url = WHITE_PRICE_URL if sub_type == "white" else COMMON_PRICE_URL
     price_name = "Белый прайс" if sub_type == "white" else "Общий прайс"
